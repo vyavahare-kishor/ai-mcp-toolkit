@@ -172,6 +172,9 @@ cd ai-pr-reviewer && uvicorn main:app --reload --port 8004
 
 ```bash
 uv run mcp dev server.py
+
+# for cross server testing
+uv run mcp dev inter_server_communication.py
 ```
 
 Try `review_pr` with a real public GitHub PR URL while watching `ai-pr-reviewer`'s terminal — you should see the incoming request logged there, confirming the call actually crossed into that repo.
@@ -184,6 +187,16 @@ Try `review_pr` with a real public GitHub PR URL while watching `ai-pr-reviewer`
     "ai-toolkit": {
       "command": "uv",
       "args": ["--directory", "/absolute/path/to/ai-mcp-toolkit", "run", "server.py"]
+    }
+  }
+}
+
+# for cross server testing
+{
+  "mcpServers": {
+    "ai-toolkit": {
+      "command": "uv",
+      "args": ["--directory", "/absolute/path/to/ai-mcp-toolkit", "run", "inter_server_communication.py"]
     }
   }
 }
