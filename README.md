@@ -1,6 +1,6 @@
 # 🔌 AI MCP Toolkit
 
-> An MCP (Model Context Protocol) server exposing three AI capabilities — web research, code review, and concept explanation — as standardized tools any MCP-compatible client can call directly, including Claude Desktop.
+> An MCP (Model Context Protocol) server that exposes AI capabilities — two of which call other running services in this portfolio over HTTP, and one self-contained — as standardized tools any MCP-compatible client can use directly, including Claude Desktop.
 
 ![Python](https://img.shields.io/badge/Python-3.11+-blue?style=flat-square&logo=python)
 ![MCP](https://img.shields.io/badge/Protocol-MCP-5A2D82?style=flat-square)
@@ -11,21 +11,23 @@
 
 ## 🎯 What It Does
 
-Every AI client built before this protocol existed needed its own custom integration to call your code — a ChatGPT plugin works differently from a LangChain tool, which works differently from a CrewAI tool. MCP standardizes that. Write a tool once as an MCP server, and **any** MCP-compatible client — Claude Desktop, Claude Code, Cursor, or a custom agent — can discover and call it the same way, with no client-specific integration code.
+MCP standardizes how an AI client calls external code. Write a tool once as an MCP server, and any MCP-compatible client — Claude Desktop, Claude Code, Cursor — can discover and call it, with no client-specific integration work.
 
-This server exposes three tools, each reusing a capability already proven in an earlier project in this portfolio rather than rebuilding logic from scratch:
+This server exposes three tools, two of which are **thin clients calling other repos' running FastAPI services over HTTP** — not reimplementations of similar logic:
 
 ```
-web_research        → Tavily search + Groq summarization   (from ai-research-agent)
-review_code_diff    → structured code review feedback        (from ai-pr-reviewer)
-explain_concept      → audience-tailored explanations          (new)
+web_research   → HTTP call to ai-research-agent's /research/ endpoint (port 8003)
+review_pr       → HTTP call to ai-pr-reviewer's /pr-review/ endpoint (port 8004)
+explain_concept  → self-contained, calls Groq directly — genuinely new, no reuse claim
 ```
 
-The point isn't the tools themselves — it's the exposure layer. Capabilities that previously only worked inside a FastAPI endpoint or a CrewAI agent now work inside **any** MCP client, with zero changes to the underlying logic.
+The distinction matters and is worth being precise about: `web_research` and `review_pr` have **no logic of their own**. If `ai-research-agent` or `ai-pr-reviewer` isn't running, those tools fail outright — they don't fall back to anything. That failure mode is the proof that this is real cross-service interconnection, not two repos that happen to do similar things.
 
 ---
 
 ## 📸 Screenshots
+
+### Running server.py
 
 **MCP Inspector — tool schemas and live testing**
 ![MCP Inspector](screenshots/mcp-inspector.png)
@@ -39,33 +41,76 @@ Settings → Developer → Local MCP servers, showing `ai-toolkit` with status `
 ![Tool call in action](screenshots/tool-call-in-chat.png)
 Claude recognizing a request matches the `web_research` tool, invoking it, and returning a result grounded in live search — not its own training data.
 
+### Running inter_server_communication.py
+
+**Without MCP Inspector — PR REVIEW**
+![MCP Inspector](screenshots/without-mcp-tool.png)
+Claude made a normal call to view the public PR and based on diff gives the suggestion.
+
+**With MCP Inspector - PR REVIEW**
+![MCP Inspector](screenshots/mcp-tool-ai-pr-reviwer.png)
+Now claude made custom mcp tool calls and forwarded the request to `ai-pr-reviewer` over HTTP and returned the identical structured result.
+
+Side by side, these two screenshots are the actual evidence of cross-service reuse — same backend, same output, two different ways of reaching it.
+
 ---
 
 ## ✨ Features
 
-- **Protocol-standard tool exposure** — built on the official MCP Python SDK (`FastMCP`), not a custom client integration
-- **Auto-generated schemas** — tool input/output schemas are derived automatically from Python type hints and docstrings, no manual schema writing
-- **Reused, not rebuilt** — each tool wraps logic already proven in a separate FastAPI project, demonstrating capability reuse across architectures
-- **Client-agnostic** — works with Claude Desktop, Claude Code, MCP Inspector, or any future MCP-compatible client without code changes
-- **Local-first development loop** — testable end-to-end via MCP Inspector before ever connecting a real client
+- **Protocol-standard tool exposure** — built on the official MCP Python SDK (`FastMCP`)
+- **Real cross-repo interconnection** — `web_research` and `review_pr` are HTTP clients of other services in this portfolio, isolated in their own module for clarity
+- **Auto-generated schemas** — tool input/output schemas derive from Python type hints and docstrings
+- **Honest dependency, not duplication** — if a backing service is down, its tool fails; nothing is silently reimplemented as a fallback
+- **Client-agnostic** — works with Claude Desktop, Claude Code, MCP Inspector, or any future MCP client unchanged
+
+---
+
+## 🏗️ Architecture
+
+```
+Claude Desktop (or any MCP client)
+        │  stdio + MCP protocol
+        ▼
+server.py  (FastMCP — tool registration, schema generation)
+        │
+        ├── explain_concept ──────────────► Groq directly (no other service)
+        │
+        └── inter_server_communication.py
+                ├── web_research ─── HTTP ──► ai-research-agent  (port 8003)
+                └── review_pr     ─── HTTP ──► ai-pr-reviewer     (port 8004)
+```
+
+`inter_server_communication.py` is a separate module specifically because it carries the cross-service dependency — keeping it isolated from `server.py` makes the "this tool depends on another repo being up" relationship explicit and easy to point to, rather than buried inside tool definitions.
 
 ---
 
 ## 🧠 How It Works
 
-A tool in this server is just a Python function with a `@mcp.tool()` decorator. `FastMCP` inspects the function's type hints and docstring to generate the JSON schema a client needs to know what the tool does, what parameters it takes, and what it returns — none of that schema is written by hand.
+`server.py` registers tools with `@mcp.tool()`. Two of those tools don't contain business logic — they import functions from `inter_server_communication.py`, which makes an HTTP `POST` to another repo's running FastAPI service and returns its response, reshaped into a readable string for the MCP client.
 
 ```python
-@mcp.tool()
-def explain_concept(concept: str, audience: str = "a senior backend engineer new to AI") -> str:
-    """Explain a technical or AI concept tailored to a specific audience's
-    background level, using concrete analogies."""
-    ...
+# inter_server_communication.py
+def call_research_agent(topic: str, depth: str = "quick") -> str:
+    response = httpx.post(
+        f"{RESEARCH_AGENT_URL}/research/",
+        json={"topic": topic, "depth": depth},
+        timeout=120
+    )
+    response.raise_for_status()
+    data = response.json()
+    findings = "\n".join(f"- {f}" for f in data.get("key_findings", []))
+    return f"{data.get('summary', '')}\n\nKey findings:\n{findings}"
 ```
 
-When a client like Claude Desktop starts, it spawns this server as a subprocess and performs a handshake (`initialize` → `tools/list`) over stdio, using the MCP protocol — not HTTP. The client now knows all three tools exist and what they need, and can call any of them mid-conversation whenever a request matches.
+```python
+# server.py
+@mcp.tool()
+def web_research(topic: str, depth: str = "quick") -> str:
+    """Run the ai-research-agent service's autonomous web research agent on a topic."""
+    return call_research_agent(topic, depth)
+```
 
-One practical lesson from building this: a client with its own native capabilities (like Claude's built-in web search) may choose its own tool over your MCP tool for ambiguous requests, since both are valid ways to satisfy it. Naming the tool explicitly, or asking for something only your tool can do, removes that ambiguity — useful to know when demoing or debugging.
+When Claude calls `review_pr` with a GitHub PR URL, the request goes: Claude → MCP server → `inter_server_communication.py` → HTTP → `ai-pr-reviewer`'s `/pr-review/` endpoint → GitHub API (to fetch the diff) → Groq (to generate the review) → back through the same chain to Claude. Five hops, three repos, one conversational request.
 
 ---
 
@@ -73,12 +118,11 @@ One practical lesson from building this: a client with its own native capabiliti
 
 ```
 ai-mcp-toolkit/
-├── server.py        # All 3 tools, FastMCP server entry point
+├── server.py                        # Tool registration, FastMCP entry point
+├── inter_server_communication.py    # HTTP clients for ai-research-agent and ai-pr-reviewer
 ├── .env.example
 └── .gitignore
 ```
-
-One file. The simplicity is the point — this is the exposure layer, not where the heavy logic lives.
 
 ---
 
@@ -89,6 +133,7 @@ One file. The simplicity is the point — this is the exposure layer, not where 
 - Python 3.11+
 - [Groq API key](https://console.groq.com) — free
 - [Tavily API key](https://tavily.com) — free
+- `ai-research-agent` and `ai-pr-reviewer` repos, runnable locally
 
 ### Installation
 
@@ -99,7 +144,7 @@ cd ai-mcp-toolkit
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv
 source .venv/bin/activate
-uv add "mcp[cli]" groq tavily-python python-dotenv
+uv add "mcp[cli]" httpx groq python-dotenv
 ```
 
 ### Configuration
@@ -109,7 +154,18 @@ cp .env.example .env
 ```
 ```bash
 GROQ_API_KEY=your_groq_api_key_here
-TAVILY_API_KEY=your_tavily_api_key_here
+RESEARCH_AGENT_URL=http://localhost:8003
+PR_REVIEWER_URL=http://localhost:8004
+```
+
+### Run the dependent services first
+
+```bash
+# Terminal 1 — ai-research-agent
+cd ai-research-agent && uvicorn main:app --reload --port 8003
+
+# Terminal 2 — ai-pr-reviewer
+cd ai-pr-reviewer && uvicorn main:app --reload --port 8004
 ```
 
 ### Test locally — MCP Inspector
@@ -118,11 +174,9 @@ TAVILY_API_KEY=your_tavily_api_key_here
 uv run mcp dev server.py
 ```
 
-Opens a local web UI listing all 3 tools. Run each one directly to verify behavior before connecting a real client.
+Try `review_pr` with a real public GitHub PR URL while watching `ai-pr-reviewer`'s terminal — you should see the incoming request logged there, confirming the call actually crossed into that repo.
 
 ### Connect to Claude Desktop
-
-Add to `claude_desktop_config.json` (Mac: `~/Library/Application Support/Claude/claude_desktop_config.json`):
 
 ```json
 {
@@ -135,16 +189,16 @@ Add to `claude_desktop_config.json` (Mac: `~/Library/Application Support/Claude/
 }
 ```
 
-Restart Claude Desktop. The tools icon should show `ai-toolkit` as connected, and all 3 tools become callable directly inside any conversation.
+Restart Claude Desktop, then ask: *"Use review_pr to review this PR: [github PR url]"*
 
 ---
 
 ## 🗺️ Roadmap
 
-- [ ] Add an MCP resource (not just tools) — expose read-only context like prior research results
-- [ ] Add an MCP prompt template for a guided workflow (e.g. structured PR review request)
-- [ ] Authentication for remote deployment (currently local-only, stdio transport)
-- [ ] Wrap the ai-customer-support-bot RAG pipeline as a 4th tool
+- [ ] Wrap `ai-customer-support-bot`'s `/support/ask` as a 4th cross-service tool
+- [ ] Add a fallback message (not silent failure) when a dependent service is unreachable
+- [ ] Add an MCP resource exposing recent research/review history
+- [ ] Authentication for remote deployment beyond local stdio
 
 ---
 
@@ -152,11 +206,11 @@ Restart Claude Desktop. The tools icon should show `ai-toolkit` as connected, an
 
 Part of an AI-native engineering portfolio. Full journey: [**ai-engineering-journey**](https://github.com/vyavahare-kishor/ai-engineering-journey)
 
-| Project | Connection to this one |
-|---------|--------------------------|
-| [**ai-research-agent**](https://github.com/vyavahare-kishor/ai-research-agent) | `web_research` tool reuses this project's search + summarize pattern |
-| [**ai-pr-reviewer**](https://github.com/vyavahare-kishor/pr-code-reviewer) | `review_code_diff` tool reuses this project's structured review approach |
-| [**ai-analyst-crew**](https://github.com/vyavahare-kishor/ai-analyst-crew) | Same Groq backend, different exposure layer — agents vs. protocol-standard tools |
+| Project | Relationship to this one |
+|---------|----------------------------|
+| [**ai-research-agent**](https://github.com/vyavahare-kishor/ai-research-agent) | `web_research` calls this repo's `/research/` endpoint directly over HTTP — a real runtime dependency |
+| [**ai-pr-reviewer**](https://github.com/vyavahare-kishor/pr-code-reviewer) | `review_pr` calls this repo's `/pr-review/` endpoint directly over HTTP — same dependency relationship |
+| [**ai-analyst-crew**](https://github.com/vyavahare-kishor/ai-analyst-crew) | Same Groq backend pattern, but no cross-service calls — useful contrast |
 
 ---
 
@@ -166,7 +220,7 @@ Part of an AI-native engineering portfolio. Full journey: [**ai-engineering-jour
 Senior Software Engineer → AI Native Engineer
 
 11+ years of backend engineering (Ruby on Rails, PostgreSQL, AWS).
-Now building production AI systems — RAG pipelines, agents, multi-agent crews, and protocol-standard tool exposure via MCP.
+Now building production AI systems — RAG pipelines, agents, multi-agent crews, and protocol-standard tool exposure with real cross-service architecture.
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0A66C2?style=flat-square&logo=linkedin&logoColor=white)](https://linkedin.com/in/vyavahare-kishor)
 [![GitHub](https://img.shields.io/badge/GitHub-Follow-black?style=flat-square&logo=github)](https://github.com/vyavahare-kishor)
